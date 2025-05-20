@@ -1,0 +1,721 @@
+/**
+ * Database Access Object for Recipe operations
+ * This module handles all database interactions related to recipes, ingredients, and dish management
+ */
+const pool = require('../config/dbconfig');
+const pluralize = require('pluralize');
+const path = require('path');
+const fs = require('fs');
+
+/**
+ * RecipesDAO class - Provides methods for interacting with recipe-related database tables
+ * Handles CRUD operations for recipes, ingredients, and related entities
+ */
+class recipesDao {
+    /**
+     * Constructor - Initializes the database connection pool
+     */
+    constructor() {
+        this.pool = pool;
+    }
+    
+    /**
+     * Utility method to get an existing record or insert a new one if it doesn't exist
+     * Used for ingredients, units, and other lookup tables
+     * 
+     * @param {Object} connection - Database connection
+     * @param {string} table - Table name to query
+     * @param {string} column - Column name to match against
+     * @param {string} value - Value to search for or insert
+     * @param {Function} cb - Callback function(error, id)
+     * @returns {void} - Returns via callback with error or ID
+     */
+    static getOrInsert(connection, table, column, value, cb) {
+      // If value is empty, return null
+      if (!value || value.trim() === '') return cb(null, null);
+
+      // Normalize input: trim, lowercase, and convert plural to singular
+      const normalized = pluralize.singular(value.trim().toLowerCase());
+
+      // First try to find the existing record
+      connection.query(`SELECT id FROM ${table} WHERE ${column} = ?`, [normalized], (err, rows) => {
+        if (err) return cb(err);
+        // If found, return the existing ID
+        if (rows.length > 0) return cb(null, rows[0].id);
+
+        // Insert only if it doesn't exist
+        connection.query(`INSERT INTO ${table} (${column}) VALUES (?)`, [normalized], (err, result) => {
+          if (err) return cb(err);
+          cb(null, result.insertId);
+        });
+      });
+    }
+
+    /**
+     * Add a new recipe to the database
+     * Handles the complex transaction of creating a dish, recipe details, instructions, and ingredients
+     * 
+     * @param {Object} req - Express request object
+     * @param {Object} res - Express response object
+     * @returns {Object} - JSON response with success/error message
+     */
+    addRecipe(req, res) {
+        // Extract basic recipe information from request body
+        const { name, category_id, prep_time, cook_time, servings } = req.body;
+        const image_filename = req.file?.filename || null;
+
+        // Initialize arrays for instructions and ingredients
+        let instructions = [];
+        let ingredients = [];
+
+        // Parse JSON strings from request body
+        try {
+          instructions = JSON.parse(req.body.instructions || '[]');
+          ingredients = JSON.parse(req.body.ingredients || '[]');
+        } catch (e) {
+          return res.status(400).json({ error: 'Invalid instructions or ingredients format' });
+        }
+
+        // Validate required fields
+        if (!name || !category_id || !instructions.length || !ingredients.length) {
+          return res.status(400).json({ error: 'Missing required fields' });
+        }
+
+        // Get a connection from the pool for transaction
+        this.pool.getConnection((err, connection) => {
+          const RecipesDao = this.constructor;
+          if (err) return res.status(500).json({ error: err.message });
+
+          // Begin database transaction
+          connection.beginTransaction(err => {
+            if (err) return res.status(500).json({ error: err.message });
+
+            // Step 1: Insert the dish record
+            connection.query(
+              "INSERT INTO dishes (name, category_id) VALUES (?, ?)",
+              [name, category_id],
+              (err, result) => {
+                if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+                const dishId = result.insertId;
+
+                // Step 2: Insert the recipe details
+                connection.query(
+                  "INSERT INTO recipes (dish_id, prep_time_minutes, cook_time_minutes, servings) VALUES (?, ?, ?, ?)",
+                  [dishId, prep_time, cook_time, servings],
+                  (err) => {
+                    if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+
+                    // Step 3: Insert instruction steps
+                    const insertInstructions = instructions.map((step, i) => [dishId, i + 1, step]);
+                    connection.query(
+                      "INSERT INTO instruction_steps (dish_id, step_number, content) VALUES ?",
+                      [insertInstructions],
+                      (err) => {
+                        if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+
+                        // Step 4: Process ingredients recursively
+                        const handleIngredient = (i) => {
+                          // If all ingredients processed, handle image and complete transaction
+                          if (i >= ingredients.length) {
+                            // If no image, commit transaction and return success
+                            if (!image_filename) {
+                              return connection.commit(err => {
+                                if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+                                connection.release();
+                                res.status(201).json({ message: 'Recipe created', dish_id: dishId });
+                              });
+                            }
+
+                            // Step 5: Handle image - check if dish already has an image
+                            connection.query(
+                              "SELECT id FROM dish_images WHERE dish_id = ?",
+                              [dishId],
+                              (err, rows) => {
+                                if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+
+                                // Determine if we need to update or insert the image
+                                const query = rows.length > 0
+                                  ? "UPDATE dish_images SET image_filename = ? WHERE dish_id = ?"
+                                  : "INSERT INTO dish_images (dish_id, image_filename) VALUES (?, ?)";
+                                const params = rows.length > 0 ? [image_filename, dishId] : [dishId, image_filename];
+
+                                // Execute the image query
+                                connection.query(query, params, (err) => {
+                                  if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+                                  
+                                  // Commit the transaction
+                                  connection.commit(err => {
+                                    if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+                                    connection.release();
+                                    res.status(201).json({ message: 'Recipe created', dish_id: dishId });
+                                  });
+                                });
+                              }
+                            );
+                            return;
+                          }
+
+                          // Process current ingredient
+                          const { name, quantity, unit_id } = ingredients[i];
+                          
+                          // Get or insert ingredient
+                          RecipesDao.getOrInsert(connection, 'ingredients', 'name', name, (err, ingredient_id) => {
+                            if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+
+                            // Get or insert unit
+                            RecipesDao.getOrInsert(connection, 'units', 'name', unit_id, (err, unit) => {
+                              if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+
+                              // Insert dish_ingredient relationship
+                              connection.query(
+                                "INSERT INTO dish_ingredients (dish_id, ingredient_id, quantity, unit_id) VALUES (?, ?, ?, ?)",
+                                [dishId, ingredient_id, quantity, unit],
+                                (err) => {
+                                  if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+                                  // Process next ingredient
+                                  handleIngredient(i + 1);
+                                }
+                              );
+                            });
+                          });
+                        };
+
+                        // Start processing ingredients
+                        handleIngredient(0);
+                      }
+                    );
+                  }
+                );
+              }
+            );
+          });
+        });
+    }
+
+    /**
+     * Retrieve all ingredients from the database
+     * 
+     * @param {Object} req - Express request object
+     * @param {Object} res - Express response object
+     * @returns {Array} - JSON array of all ingredients
+     */
+    getAllIngredients(req, res) {
+      this.pool.query("SELECT id, name FROM ingredients ORDER BY name;", (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+      });
+    }
+
+    /**
+     * Get simple recipe information for list view
+     * Returns basic details about all recipes
+     * 
+     * @param {Object} req - Express request object
+     * @param {Object} res - Express response object
+     * @returns {Array} - JSON array of recipe summaries
+     */
+    getSimpleInfo(req, res) {
+        this.pool.query(`
+        SELECT 
+            dishes.id,
+            dishes.name,
+            dish_images.image_filename
+        FROM dishes
+        INNER JOIN dish_images ON dishes.id = dish_images.dish_id
+        ORDER BY dishes.id;`,
+        (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+
+        // Format the response data
+        const recipes = rows.map(row => ({
+          id: row.id,
+          name: row.name,
+          image_url: row.image_filename ? `/imgs/${row.image_filename}` : null
+        }));
+
+        res.json(recipes);
+            });
+    }
+
+    /**
+     * Get full recipe details including ingredients
+     * Returns comprehensive information about all recipes
+     * 
+     * @param {Object} req - Express request object
+     * @param {Object} res - Express response object
+     * @returns {Array} - JSON array of complete recipe objects
+     */
+    getFullRecipes(req, res) {
+            const sql = `
+                SELECT
+                    d.id AS dish_id,
+                    d.name AS recipe_name,
+                    di.image_filename,
+                    r.prep_time_minutes,
+                    r.cook_time_minutes,
+                    r.servings,
+                    r.instructions,
+                    ing.name AS ingredient_name,
+                    dish_ing.quantity,
+                    dish_ing.unit,
+                    c.name AS category_name
+                FROM recipes r
+                INNER JOIN dishes d ON r.dish_id = d.id
+                INNER JOIN dish_images di ON d.id = di.dish_id
+                INNER JOIN dish_ingredients dish_ing ON d.id = dish_ing.dish_id
+                INNER JOIN ingredients ing ON dish_ing.ingredient_id = ing.id
+                INNER JOIN categories c ON ing.category_id = c.id
+                ORDER BY d.id, ingredient_name;
+            `;
+
+            this.pool.query(sql, (err, rows) => {
+                if (err) return res.status(500).json({ error: err.message });
+
+                // Group results by dish_id to organize ingredients under each recipe
+                const recipes = {};
+                rows.forEach(row => {
+                    // Create recipe object if it doesn't exist
+                    if (!recipes[row.dish_id]) {
+                        recipes[row.dish_id] = {
+                            id: row.dish_id,
+                            name: row.recipe_name,
+                            image_url: `/imgs/${row.image_filename}`,
+                            prep_time: row.prep_time_minutes,
+                            cook_time: row.cook_time_minutes,
+                            servings: row.servings,
+                            instructions: row.instructions,
+                            ingredients: []
+                        };
+                    }
+
+                    // Add ingredient to the recipe
+                    recipes[row.dish_id].ingredients.push({
+                        name: row.ingredient_name,
+                        quantity: row.quantity,
+                        unit: row.unit,
+                        category: row.category_name
+                    });
+                });
+
+                // Convert object to array for response
+                res.json(Object.values(recipes));
+            });
+    }
+
+    /**
+     * Get recipes filtered by category
+     * 
+     * @param {Object} req - Express request object with category parameter
+     * @param {Object} res - Express response object
+     * @returns {Array} - JSON array of recipes in the specified category
+     */
+    getRecipesByCategory(req, res) {
+      const { category } = req.params;
+
+      this.pool.query(`
+        SELECT 
+          dishes.id,
+          dishes.name,
+          dish_images.image_filename
+        FROM dishes
+        INNER JOIN dish_images ON dishes.id = dish_images.dish_id
+        INNER JOIN categories ON dishes.category_id = categories.id
+        WHERE categories.name = ?
+        ORDER BY dishes.id;
+      `, [category], (err, rows) => {
+        if (err) {
+          console.error("SQL error:", err.message);
+          return res.status(500).json({ error: err.message });
+        }
+
+        // Format the response data
+        const recipes = rows.map(row => ({
+          id: row.id,
+          name: row.name,
+          image_url: row.image_filename ? `/imgs/${row.image_filename}` : null
+        }));
+
+        res.json(recipes);
+      });
+    }
+
+    /**
+     * Get recipes that contain a specific ingredient
+     * 
+     * @param {Object} req - Express request object with ingredient name parameter
+     * @param {Object} res - Express response object
+     * @returns {Array} - JSON array of recipes containing the specified ingredient
+     */
+    getRecipesByIngredient(req, res) {
+      const { name } = req.params;
+
+      this.pool.query(`
+        SELECT 
+          dishes.id,
+          dishes.name,
+          dish_images.image_filename
+        FROM dishes
+        INNER JOIN dish_images ON dishes.id = dish_images.dish_id
+        INNER JOIN dish_ingredients ON dishes.id = dish_ingredients.dish_id
+        INNER JOIN ingredients ON dish_ingredients.ingredient_id = ingredients.id
+        WHERE ingredients.name = ?
+        GROUP BY dishes.id
+        ORDER BY dishes.id;
+      `, [name], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+
+        // Format the response data
+        const recipes = rows.map(row => ({
+          id: row.id,
+          name: row.name,
+          image_url: row.image_filename ? `/imgs/${row.image_filename}` : null
+        }));
+
+        res.json(recipes);
+      });
+    }
+
+    /**
+     * Get detailed information about a single recipe by ID
+     * Includes all recipe details, ingredients, and instruction steps
+     * 
+     * @param {Object} req - Express request object with recipe ID parameter
+     * @param {Object} res - Express response object
+     * @returns {Object} - JSON object with complete recipe details
+     */
+    getRecipeById(req, res) {
+      const id = req.params.id;
+
+      // Query for recipe details and ingredients
+      this.pool.query(`
+        SELECT
+          d.id AS dish_id,
+          d.name AS recipe_name,
+          d.category_id,                          
+          di.image_filename,
+          r.prep_time_minutes,
+          r.cook_time_minutes,
+          r.servings,
+          ing.name AS ingredient_name,
+          dish_ing.quantity,
+          u.name AS unit_name,
+          c.name AS category_name
+        FROM recipes r
+        INNER JOIN dishes d ON r.dish_id = d.id
+        INNER JOIN dish_images di ON d.id = di.dish_id
+        INNER JOIN dish_ingredients dish_ing ON d.id = dish_ing.dish_id
+        INNER JOIN ingredients ing ON dish_ing.ingredient_id = ing.id
+        INNER JOIN categories c ON d.category_id = c.id
+        LEFT JOIN units u ON dish_ing.unit_id = u.id
+        WHERE d.id = ?;
+      `, [id], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        if (rows.length === 0) return res.status(404).json({ error: 'Recipe not found' });
+
+        // Get the first row for basic recipe info
+        const base = rows[0];
+
+        // Construct the recipe object
+        const recipe = {
+          id: base.dish_id,
+          name: base.recipe_name,
+          category_id: base.category_id,                
+          image_url: base.image_filename ? '/imgs/' + base.image_filename : null,
+          prep_time: base.prep_time_minutes,
+          cook_time: base.cook_time_minutes,
+          servings: base.servings,
+          instructions: [],
+          ingredients: rows.map(row => ({
+            name: row.ingredient_name,
+            quantity: row.quantity,
+            unit: row.unit_name || '',
+            category: row.category_name
+          }))
+        };
+
+        // Load instruction steps in a separate query
+        this.pool.query(
+          `SELECT step_number, content FROM instruction_steps WHERE dish_id = ? ORDER BY step_number`,
+          [id],
+          (err2, stepRows) => {
+            if (err2) return res.status(500).json({ error: err2.message });
+
+            // Format instruction steps
+            recipe.instructions = stepRows.map((step, i) => `Step ${i + 1}: ${step.content}`);
+            res.json(recipe);
+          }
+        );
+      });
+    }
+
+    /**
+     * Delete a recipe and all associated data
+     * Removes records from multiple tables in a transaction
+     * 
+     * @param {Object} req - Express request object with recipe ID parameter
+     * @param {Object} res - Express response object
+     * @returns {Object} - JSON response with success/error message
+     */
+    deleteRecipe(req, res) {
+        const dishId = req.params.id;
+
+        // Get a connection from the pool for transaction
+        this.pool.getConnection((err, connection) => {
+          if (err) return res.status(500).json({ error: err.message });
+
+          // Begin database transaction
+          connection.beginTransaction(err => {
+            if (err) return res.status(500).json({ error: err.message });
+
+            // First get the image filename for later deletion
+            connection.query(
+              "SELECT image_filename FROM dish_images WHERE dish_id = ?",
+              [dishId],
+              (err, result) => {
+                if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+
+                const image_filename = result[0]?.image_filename;
+                
+                // Define deletion steps in order (respecting foreign key constraints)
+                const deleteSteps = [
+                  `DELETE FROM instruction_steps WHERE dish_id = ?`,
+                  `DELETE FROM dish_ingredients WHERE dish_id = ?`,
+                  `DELETE FROM dish_images WHERE dish_id = ?`,
+                  `DELETE FROM recipes WHERE dish_id = ?`,
+                  `DELETE FROM dishes WHERE id = ?`
+                ];
+
+                // Recursive function to execute deletion steps in sequence
+                const executeStep = (i) => {
+                  // If all steps completed, commit transaction
+                  if (i >= deleteSteps.length) {
+                    connection.commit(err => {
+                      if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+
+                      // After DB is cleaned, try removing the image file
+                      if (image_filename) {
+                        const imagePath = path.join(__dirname, '../../src/imgs', image_filename);
+                        fs.unlink(imagePath, (fsErr) => {
+                          if (fsErr && fsErr.code !== 'ENOENT') {
+                            console.warn('Image deletion warning:', fsErr);
+                          }
+                        });
+                      }
+
+                      connection.release();
+                      res.json({ message: 'Recipe and image deleted', dish_id: dishId });
+                    });
+                    return;
+                  }
+
+                  // Execute current deletion step
+                  connection.query(deleteSteps[i], [dishId], (err) => {
+                    if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+                    executeStep(i + 1);
+                  });
+                };
+
+                // Start the deletion process
+                executeStep(0);
+              }
+            );
+          });
+        });
+    }
+
+    /**
+     * Search for recipes by name or ingredient
+     * 
+     * @param {Object} req - Express request object with search query
+     * @param {Object} res - Express response object
+     * @returns {Array} - JSON array of matching recipes
+     */
+    searchRecipes(req, res) {
+      const { query } = req.query;
+
+      // Validate search query
+      if (!query || query.trim() === '') {
+        return res.status(400).json({ error: "Search query is required" });
+      }
+
+      // Format search term for LIKE query
+      const searchTerm = `%${query}%`;
+
+      // SQL query to search in both dish names and ingredient names
+      const sql = `
+        SELECT DISTINCT d.id, d.name, di.image_filename
+        FROM dishes d
+        LEFT JOIN dish_images di ON d.id = di.dish_id
+        LEFT JOIN dish_ingredients dii ON d.id = dii.dish_id
+        LEFT JOIN ingredients i ON dii.ingredient_id = i.id
+        WHERE d.name LIKE ? OR i.name LIKE ?
+        ORDER BY d.name
+      `;
+
+      this.pool.query(sql, [searchTerm, searchTerm], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+
+        // Format the response data
+        const results = rows.map(row => ({
+          id: row.id,
+          name: row.name,
+          image_url: row.image_filename ? `/imgs/${row.image_filename}` : null
+        }));
+
+        res.json(results);
+      });
+    }
+
+    /**
+     * Update an existing recipe
+     * Handles updating all aspects of a recipe in a transaction
+     * 
+     * @param {Object} req - Express request object with recipe data and ID
+     * @param {Object} res - Express response object
+     * @returns {Object} - JSON response with success/error message
+     */
+    updateRecipe(req, res) {
+        // Extract basic recipe information from request
+        const { name, category_id, prep_time, cook_time, servings } = req.body;
+        const dishId = req.params.id;
+        const image_filename = req.file?.filename || req.body.image_filename || null;
+
+        // Initialize arrays for instructions and ingredients
+        let instructions = [];
+        let ingredients = [];
+
+        // Parse JSON strings from request body
+        try {
+          instructions = JSON.parse(req.body.instructions || '[]');
+          ingredients = JSON.parse(req.body.ingredients || '[]');
+        } catch (e) {
+          return res.status(400).json({ error: 'Invalid instructions or ingredients format' });
+        }
+
+        // Validate required fields
+        if (!name || !category_id || !instructions.length || !ingredients.length) {
+          return res.status(400).json({ error: 'Missing required fields' });
+        }
+
+        // Get a connection from the pool for transaction
+        this.pool.getConnection((err, connection) => {
+          const RecipesDao = this.constructor;
+          if (err) return res.status(500).json({ error: err.message });
+
+          // Begin database transaction
+          connection.beginTransaction(err => {
+            if (err) return res.status(500).json({ error: err.message });
+
+            // Step 1: Update the dish record
+            connection.query(
+              `UPDATE dishes SET name = ?, category_id = ? WHERE id = ?`,
+              [name, category_id, dishId],
+              (err) => {
+                if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+
+                // Step 2: Update the recipe details
+                connection.query(
+                  `UPDATE recipes SET prep_time_minutes = ?, cook_time_minutes = ?, servings = ? WHERE dish_id = ?`,
+                  [prep_time, cook_time, servings, dishId],
+                  (err) => {
+                    if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+
+                    // Step 3: Delete and re-insert instruction steps
+                    connection.query(`DELETE FROM instruction_steps WHERE dish_id = ?`, [dishId], (err) => {
+                      if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+
+                      const steps = instructions.map((step, i) => [dishId, i + 1, step]);
+                      connection.query(
+                        `INSERT INTO instruction_steps (dish_id, step_number, content) VALUES ?`,
+                        [steps],
+                        (err) => {
+                          if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+
+                          // Step 4: Delete and re-insert ingredients
+                          connection.query(`DELETE FROM dish_ingredients WHERE dish_id = ?`, [dishId], (err) => {
+                            if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+
+                            // Process ingredients recursively
+                            const handleIngredient = (i) => {
+                              // If all ingredients processed, handle image and complete transaction
+                              if (i >= ingredients.length) {
+                                // If no image, commit transaction and return success
+                                if (!image_filename) {
+                                  return connection.commit(err => {
+                                    if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+                                    connection.release();
+                                    res.json({ message: 'Recipe updated', dish_id: dishId });
+                                  });
+                                }
+
+                                // Step 5: Handle image - check if dish already has an image
+                                connection.query(
+                                  "SELECT id FROM dish_images WHERE dish_id = ?",
+                                  [dishId],
+                                  (err, rows) => {
+                                    if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+
+                                    // Determine if we need to update or insert the image
+                                    const query = rows.length > 0
+                                      ? "UPDATE dish_images SET image_filename = ? WHERE dish_id = ?"
+                                      : "INSERT INTO dish_images (dish_id, image_filename) VALUES (?, ?)";
+                                    const params = rows.length > 0 ? [image_filename, dishId] : [dishId, image_filename];
+
+                                    // Execute the image query
+                                    connection.query(query, params, (err) => {
+                                      if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+                                      
+                                      // Commit the transaction
+                                      connection.commit(err => {
+                                        if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+                                        connection.release();
+                                        res.json({ message: 'Recipe updated', dish_id: dishId });
+                                      });
+                                    });
+                                  }
+                                );
+                                return;
+                              }
+
+                              // Process current ingredient
+                              const { name, quantity, unit_id } = ingredients[i];
+                              
+                              // Get or insert ingredient
+                              RecipesDao.getOrInsert(connection, 'ingredients', 'name', name, (err, ingredient_id) => {
+                                if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+
+                                // Get or insert unit
+                                RecipesDao.getOrInsert(connection, 'units', 'name', unit_id, (err, unit) => {
+                                  if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+
+                                  // Insert dish_ingredient relationship
+                                  connection.query(
+                                    `INSERT INTO dish_ingredients (dish_id, ingredient_id, quantity, unit_id) VALUES (?, ?, ?, ?)`,
+                                    [dishId, ingredient_id, quantity, unit],
+                                    (err) => {
+                                      if (err) return connection.rollback(() => res.status(500).json({ error: err.message }));
+                                      // Process next ingredient
+                                      handleIngredient(i + 1);
+                                    }
+                                  );
+                                });
+                              });
+                            };
+
+                            // Start processing ingredients
+                            handleIngredient(0);
+                          });
+                        }
+                      );
+                    });
+                  }
+                );
+              }
+            );
+          });
+        });
+      }
+}
+
+// Export the class for use in other modules
+module.exports = recipesDao;
